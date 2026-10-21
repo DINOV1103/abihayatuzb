@@ -346,7 +346,27 @@ h2.certificate{font-weight:800;font-size:clamp(13px, 4.2vw, 17px);line-height:14
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   };
 
-  /* ---------- Meta Pixel ---------- */
+  /* ---------- Meta Pixel + Conversions API ----------
+     Ҳар бир ҳодиса икки йўл билан кетади, event_id бир хил:
+       1) браузердан — Meta Pixel
+       2) сервердан  — /api/capi (токен Vercel'да: META_CAPI_TOKEN)
+     Meta уларни битта ҳодиса деб санайди (дубликат бўлмайди).
+     Телефон ва исм Meta'га фақат SHA-256 билан шифрланган ҳолда кетади.
+     Синов: манзилга ?test_event=TEST12345 қўшиб очинг →
+     Events Manager → Test events. */
+  const CAPI_URL = '/api/capi';
+  const Q = window.location.search;
+
+  function ls(k, v){
+    try{ if(v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }catch(e){}
+    return null;
+  }
+  function ss(k, v){
+    try{ if(v === undefined) return sessionStorage.getItem(k); sessionStorage.setItem(k, v); }catch(e){}
+    return null;
+  }
+  function rnd(){ return Math.random().toString(36).slice(2, 10); }
+
   if(CONFIG.PIXEL_ID){
     !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
     n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
@@ -354,11 +374,101 @@ h2.certificate{font-weight:800;font-size:clamp(13px, 4.2vw, 17px);line-height:14
     t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
     document,'script','https://connect.facebook.net/en_US/fbevents.js');
     window.fbq('init', CONFIG.PIXEL_ID);
-    window.fbq('track', 'PageView');
   }
-  function track(name, data){
-    try{ if(window.fbq) window.fbq('track', name, data || {}); }catch(e){}
+
+  /* Доимий меҳмон ID — Meta бир одамнинг ҳодисаларини боғлаши учун */
+  let visitor = ls('abh_vid');
+  if(!visitor || !/^[a-z0-9]{8,40}$/.test(visitor)){
+    visitor = Date.now().toString(36) + rnd() + rnd();
+    ls('abh_vid', visitor);
   }
+
+  const tm = Q.match(/[?&]test_event=([A-Za-z0-9_-]{3,40})/);
+  if(tm) ss('abh_test_event', tm[1]);
+  const testCode = ss('abh_test_event') || '';
+
+  function cookie(n){
+    const m = document.cookie.match('(?:^|; )' + n + '=([^;]*)');
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+  function fbc(){
+    let c = cookie('_fbc');
+    if(c) return c;
+    const m = Q.match(/[?&]fbclid=([A-Za-z0-9_-]{10,500})/);
+    if(m){ c = 'fb.1.' + Date.now() + '.' + m[1]; ss('abh_fbc', c); return c; }
+    return ss('abh_fbc') || '';
+  }
+  fbc();
+
+  /* Pixel скрипти юклангунча кутамиз (_fbp cookie пайдо бўлиши учун) — кўпи билан 2.5 с */
+  const ready = new Promise(function(done){
+    let ok = false;
+    function go(){ if(!ok){ ok = true; setTimeout(done, 60); } }
+    const s = document.querySelector('script[src*="connect.facebook.net"]');
+    if(s){ s.addEventListener('load', go); s.addEventListener('error', go); }
+    setTimeout(go, 2500);
+  });
+
+  function sha(v){
+    v = String(v || '');
+    if(!v || !window.crypto || !crypto.subtle || !window.TextEncoder) return Promise.resolve('');
+    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)).then(function(buf){
+      return Array.prototype.map.call(new Uint8Array(buf), function(x){
+        return ('0' + x.toString(16)).slice(-2);
+      }).join('');
+    }).catch(function(){ return ''; });
+  }
+
+  /* user.phone — давлат коди билан тўлиқ рақам (масалан 998901234567) */
+  function hashUser(u){
+    u = u || {};
+    const ph = onlyDigits(u.phone);
+    let fn = String(u.name || '').toLowerCase().trim().split(/\s+/)[0] || '';
+    try{ fn = fn.replace(new RegExp('[^\\p{L}]', 'gu'), ''); }catch(e){ fn = fn.replace(/[0-9.,'"`!?()\-]/g, ''); }
+    return Promise.all([
+      ph.length >= 10 && ph.length <= 15 ? sha(ph) : '',
+      fn ? sha(fn) : '',
+      sha('uz'),
+      sha(visitor)
+    ]).then(function(h){
+      const o = { country:h[2], external_id:h[3] };
+      if(h[0]) o.ph = h[0];
+      if(h[1]) o.fn = h[1];
+      return o;
+    });
+  }
+
+  function toServer(name, id, custom, user){
+    Promise.all([hashUser(user), ready]).then(function(r){
+      const body = {
+        event_name:name,
+        event_id:id,
+        event_source_url:String(window.location.href).slice(0, 1000),
+        custom_data:custom || {},
+        user:r[0],
+        fbp:cookie('_fbp'),
+        fbc:fbc()
+      };
+      if(testCode) body.test_event_code = testCode;
+      return fetch(CAPI_URL, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body:JSON.stringify(body),
+        keepalive:true,
+        credentials:'same-origin'
+      });
+    }).catch(function(){});
+  }
+
+  /* track('Lead', { content_name:'ABIHAYAT' }, { phone:'998901234567', name:'Гулнора' }) */
+  function track(name, data, user){
+    const id = name + '.' + Date.now().toString(36) + '.' + rnd();
+    try{ if(window.fbq) window.fbq('track', name, data || {}, { eventID:id }); }catch(e){}
+    toServer(name, id, data, user);
+    return id;
+  }
+
+  track('PageView');
 
   /* ---------- Видеолар ---------- */
   (function buildVideos(){
@@ -563,7 +673,7 @@ h2.certificate{font-weight:800;font-size:clamp(13px, 4.2vw, 17px);line-height:14
           return;
         }
         try{ localStorage.setItem(key, JSON.stringify({ t:Date.now() })); }catch(err){}
-        track('Lead', { content_name:'ABIHAYAT' });
+        track('Lead', { content_name:'ABIHAYAT' }, { phone:cur.c.replace('+', '') + digits, name:name });
       }
       o.done();
     });
